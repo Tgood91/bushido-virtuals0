@@ -1,0 +1,34 @@
+{
+  "taskName": "3×day micro",
+  "schedule": "0 */4 * * *",
+  "scheduleLabel": "Every 4h",
+  "action": "Execute micro-swap via CDP backend",
+  "prompt": "Swap 0.05 BASE_USDC to VIRTUAL on Aerodrome (Base network) using CDP backend. Use Aerodome mirrors: https://aero.drome.eth.limo or https://aero.drome.eth.link as fallback. Send confirmation to nodle_micro-swaps@agents.world. Repeat every 4 hours until wallet balance insufficient for next swap.",
+  "swapConfig": {
+    "amount": "0.05",
+    "fromToken": "USDC",
+    "toToken": "VIRTUAL",
+    "network": "base",
+    "venue": "Aerodrome",
+    "aerodromeMirrors": [
+      "https://aero.drome.eth.limo",
+      "https://aero.drome.eth",
+      "https://aero.drome.eth.link"
+    ],
+    "tokenAddresses": {
+      "USDC": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "VIRTUAL": "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b"
+    }
+  },
+  "executionRules": {
+    "frequency": "Every 4 hours",
+    "dailyExecutions": 3,
+    "stopCondition": "When wallet balance < 0.05 USDC",
+    "notificationEmail": "nodle_micro-swaps@agents.world"
+  },
+  "backend": {
+    "method": "CDP API",
+    "authentication": "API key + wallet secret (stored securely on backend)",
+    "workflow": "encode → sign → send via CDP"
+  }
+}
