@@ -1,108 +1,136 @@
-# CoinGecko Agent SKILL
+# agent-infra
 
-An installable package that gives AI agents built-in knowledge of the [CoinGecko API](https://www.coingecko.com/en/api), including endpoints, parameters, and common workflows.
-
-- Instead of manually explaining the API to your agent every time, the **SKILL lets your agent understand CoinGecko data instantly** and respond with accurate queries and code.
-- Works with popular AI coding agents and tools such as **Claude Code**, **Gemini CLI**, **Codex CLI**, and other SKILL-compatible agents. Setup takes less than 3 minutes.
-
-📖 Full documentation: [docs.coingecko.com/docs/skills](https://docs.coingecko.com/docs/skills)
+Central reference repo for on-chain agent infrastructure — router configuration, RPC failover, and the swap orchestrator agent that ties Seykota and Druckenmiller signals into executable trades.
 
 ---
 
-## Installation
-
-### Claude.ai
-
-1. Download the SKILL package: [skills-main.zip](https://github.com/coingecko/skills/archive/refs/heads/main.zip)
-2. Go to [claude.ai/customize/skills](https://claude.ai/customize/skills)
-3. Click **+** → **Upload a skill**
-4. Upload the `skills-main.zip` file
-
-> [!NOTE]
-> Claude.ai users on paid plans should add `api.coingecko.com` and `pro-api.coingecko.com` to their domain allowlist at [claude.ai/settings/capabilities](https://claude.ai/settings/capabilities).<br/><br/>
-> Follow this guide here: http://docs.coingecko.com/docs/skills#allowlist-coingecko-domains-claude-paid-plans-only
-
-### Agents / LLMs
-
-*Such as Claude Code, Gemini CLI, Codex CLI*
-
-#### Via [skills.sh](https://skills.sh/)
-
-```bash
-npm install -g skills
-npx skills add coingecko/skills -g -y
-```
-
-*`-g` flag installs globally for all agents. See [npmjs/skills](https://www.npmjs.com/package/skills) for more details.*
-
-#### Via GitHub
-
-```bash
-git clone https://github.com/coingecko/skills.git coingecko-skills
-
-# Move to your agent's skills directory (example: Claude Code on Mac/Linux)
-mv coingecko-skills ~/.claude/skills/coingecko
-```
-
-*The exact path may vary based on your agent and operating system.*
-
----
-
-## What's Inside
+## Architecture Overview
 
 ```
-SKILL.md                     # Main entry point — workflow, reference index
-references/
-  ├── core.md                    # Auth, rate limits, methodology (always read)
-  ├── claude-env.md              # Claude-specific constraints & workarounds
-  ├── common-use-cases.md        # Common workflows for price queries, historical data, etc.
-  ├── coins.md                   # Prices, market data, metadata, gainers/losers
-  ├── coin-history.md            # Historical charts, OHLC, time-range queries
-  ├── coin-supply.md             # Circulating/total supply charts
-  ├── contract.md                # Lookup by token contract address
-  ├── asset-platforms.md         # Supported blockchains for token contracts, token lists
-  ├── categories.md              # Coin categories & sector market data
-  ├── exchanges.md               # Spot & DEX exchange data, volume charts
-  ├── derivatives.md             # Derivatives exchanges & tickers
-  ├── treasury.md                # Public company crypto treasury holdings
-  ├── nfts.md                    # NFT collections, market data, charts
-  ├── global.md                  # Global market stats & DeFi data
-  ├── utils.md                   # Search, trending, exchange rates, API status
-  ├── onchain-networks.md        # Supported networks and DEXes (ID mapping)
-  ├── onchain-pools.md           # Pool discovery, trending/new pools
-  ├── onchain-tokens.md          # Token data, holders, traders
-  ├── onchain-ohlcv-trades.md    # Onchain OHLCV and trade data
-  └── onchain-categories.md      # Onchain category data (GeckoTerminal specific)
+┌─────────────────┐     ┌──────────────────┐
+│  Seykota Agent   │     │ Druckenmiller     │
+│  (trend signals) │     │ Agent (macro/     │
+│                  │     │ asymmetry signals)│
+└────────┬─────────┘     └────────┬──────────┘
+         │                         │
+         └───────────┬─────────────┘
+                      ▼
+         ┌────────────────────────────┐
+         │   Swap Orchestrator Agent   │
+         │   - signal alignment check  │
+         │   - nodle_micro-swaps       │
+         │     (sub-function)          │
+         │   - router failover         │
+         │   - RPC failover             │
+         │   - CDP execution            │
+         └────────────┬────────────────┘
+                       ▼
+              ┌─────────────────┐
+              │   Base Chain     │
+              │  (via CDP wallet)│
+              └─────────────────┘
+```
+
+The orchestrator does not generate its own market view. It consumes signals from Seykota (trend/EMA scoring) and Druckenmiller (macro regime + asymmetry), checks for **alignment**, and — when aligned — executes a swap via Coinbase Developer Platform (CDP) using the router/RPC failover chains defined below.
+
+---
+
+## Router Configuration
+
+Routers are tried in order. If `PRIMARY_ROUTER` quote fails, reverts, or times out, the orchestrator falls back to the next router in sequence.
+
+| Role | Address | Identity | Verified |
+|---|---|---|---|
+| `PRIMARY_ROUTER` | `0x111111125421cA6dc452d289314280a0f8842A65` | 1inch v5 Aggregation Router | ✓ |
+| `FALLBACK_ROUTER_1` | `0x1231deb6f5749ef6ce6943a275a1d3e7486f4eae` | LI.FI LiFi Diamond (cross-chain proxy) | ✓ |
+| `FALLBACK_ROUTER_2` | `0x6fF5693b99212Da76ad316178A184AB56D299b43` | 0x Protocol-style router (Permit2/Uniswap V3) | ✓ |
+
+All three addresses are public, verified contracts — safe to commit. See `/config/routers.json`.
+
+### Failover logic
+
+1. Request quote from `PRIMARY_ROUTER`
+2. If quote fails or slippage exceeds tolerance → try `FALLBACK_ROUTER_1`
+3. If that fails → try `FALLBACK_ROUTER_2`
+4. If all three fail → abort swap, log alert, do NOT retry blindly (prevents repeated failed gas spend)
+
+---
+
+## RPC Configuration
+
+### Primary Layer
+| Variable | Endpoint | Type |
+|---|---|---|
+| `COINBASE_RPC` | `https://developer-access-mainnet.base.org` | HTTP — primary read/write |
+| `TENDERLY_WSS` | `wss://base.gateway.tenderly.co` | WebSocket — real-time event/mempool monitoring |
+
+### Fallback Layer (in order)
+| Variable | Endpoint |
+|---|---|
+| `FALLBACK_RPC_1` | `https://1rpc.io/base` |
+| `FALLBACK_RPC_2` | `https://base.api.pocket.network` |
+
+### Failover logic
+
+- All transaction submissions go through `COINBASE_RPC` first
+- If `COINBASE_RPC` is unresponsive (timeout > 5s or 5xx) → `FALLBACK_RPC_1` → `FALLBACK_RPC_2`
+- `TENDERLY_WSS` is used independently for real-time monitoring (mempool watch, pending tx alerts) — does not participate in the write-path failover chain
+- Health checks run every cycle; the orchestrator logs which RPC tier served each request for debugging
+
+---
+
+## Data Layer
+
+| Source | Purpose | Key Required |
+|---|---|---|
+| CoinGecko | Price, volume, market data | `COINGECKO_API_KEY` (free tier OK) |
+| DeFiLlama | TVL, fees, DEX volume, bridges | No key |
+| Basescan | NFT/token transfer history | `BASESCAN_API_KEY` |
+
+---
+
+## Agent Roles
+
+### Seykota (Trend)
+EMA-based trend scoring (-7 to +7). Generates LONG/SHORT/CLOSE signals per the Fresh Eyes rule. See `seykota/` for handlers.
+
+### Druckenmiller (Macro)
+Macro regime classification + asymmetry (reward/risk) scoring + concentration audit. Generates ADD/HOLD/TRIM/EXIT_NOW per position. See `druckenmiller/` for handlers.
+
+### Swap Orchestrator (this repo's new component)
+- **Mode: AUTO-EXECUTE via CDP**
+- Polls both agents' latest signal output
+- Requires **signal alignment**: Seykota direction must agree with Druckenmiller's `fundamental_signal` / `action` for the same asset
+- On alignment, computes swap parameters and executes via CDP wallet
+- `nodle_micro-swaps` runs as a scheduled sub-function — independent of signal alignment, on its fixed 4-hour USDC→VIRTUAL cycle on Aerodrome
+- All swaps logged with: signal source, alignment score, router used, RPC tier used, tx hash, gas cost
+
+See `orchestrator/` for the handler and config.
+
+---
+
+## Directory Structure
+
+```
+/config
+  ├── routers.json        — router addresses + failover order (public, safe to commit)
+  ├── rpc-config.json      — RPC endpoints + failover order (public endpoints, safe to commit)
+  └── .env.example          — template for secrets (COMMIT this)
+.env                         — actual API keys (GITIGNORE this — never commit)
+
+/orchestrator
+  ├── swap-orchestrator-handler.ts  — main ACP job: alignment check + CDP execution
+  └── nodle-micro-swaps-handler.ts  — sub-function: scheduled USDC→VIRTUAL swaps
+
+/seykota       — Seykota agent handlers
+/druckenmiller — Druckenmiller agent handlers
 ```
 
 ---
 
-## Try It Out
+## Security Notes
 
-Once installed, try asking your agent questions like:
-
-> *"If I invested $100 in Bitcoin back in December 2018, how much would it be worth today?"*
-
-> *"What was the ATH of XPL?"*
-
-> *"What is the current market cap of DZnQi17HFgSM8mJ4nhVicz32B97XyTsd6MUVuDJgP9Jo from Solana?"*
-
-> *"What if I only left $50 in my wallet? Which coins should I buy to maximize my returns based on the current market?"*
-
-> *"What are the top NFT collections this week?"*
-
-Have fun experimenting!
-
----
-
-## Feedback
-
-Tell us how you're using the CoinGecko SKILL and what we should improve — reach out to `eason.lim@coingecko[dot]com`.
-
-or open a GitHub issue: [coingecko/skills/issues](https://github.com/coingecko/skills/issues/new?labels=community)
-
----
-
-## License
-
-[MIT](LICENSE)
+- `.env` is gitignored. `.env.example` contains placeholder values only.
+- Router and RPC addresses in `/config/*.json` are public infrastructure — safe to version control.
+- CDP wallet credentials are managed via Anthropic's EconomyOS / ACP identity layer — never stored in this repo.
+- Auto-execution mode means a failed alignment check or router failure should ALWAYS fail closed (no trade), never fail open.
