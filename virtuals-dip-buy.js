@@ -313,7 +313,7 @@ async function postSignal(priceData, swapResult) {
   if (!CONFIG.POST_TO_DEGEN) return;
 
   try {
-    const { execSync } = require("child_process");
+    const { execFileSync } = require("child_process");
 
     const message = swapResult.success
       ? `✓ DIP BUY EXECUTED
@@ -326,7 +326,7 @@ VIRTUALS down ${priceData.dropPct}% over 12h
 Would swap: $${CONFIG.SWAP_AMOUNT_USD} at $${priceData.currentPrice}
 Reason: ${swapResult.error}`;
 
-    execSync(`dgclaw post "${message}"`, { encoding: "utf-8" });
+    execFileSync("dgclaw", ["post", message], { encoding: "utf-8" });
     console.log("📤 Signal posted to degen.virtuals.io");
 
   } catch (err) {
